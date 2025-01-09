@@ -15,21 +15,64 @@
 [![QAequilibraE artifacts](https://github.com/AequilibraE/aequilibrae/actions/workflows/build_artifacts_qgis.yml/badge.svg)](https://github.com/AequilibraE/aequilibrae/actions/workflows/build_artifacts_qgis.yml)
 
 
-AequilibraE is the first comprehensive Python package for transportation modeling. It aims to provide all the
-resources not available from other open-source packages in the Python (NumPy, really) ecosystem.
+AequilibraE is a fully-featured Open-Source transportation modeling package and
+the first comprehensive package of its kind for the Python ecosystem, and is 
+released under an extremely permissive and business-friendly license.
+
+It is developed as general-purpose modeling software and imposes very little 
+underlying structure on models built upon it. This flexibility also extends to
+the ability of using all its core algorithms without an actual AequilibraE 
+model by simply building very simple memory objects from Pandas DataFrames, and
+NumPY arrays, making it the perfect candidate for use-cases where transport is 
+one component of a bigger and more general planning or otherwise analytical 
+modeling pipeline.
+
+Different than in traditional packages, AequilibraE's network is stored in 
+SQLite/Spatialite, a widely supported open format, and its editing capabilities
+are built into its data layer through a series of spatial database triggers, 
+which allows network editing to be done on Any GIS package supporting SpatiaLite, 
+through a dedicated Python API or directly from an SQL console while maintaining
+full geographical consistency between links and nodes, as well as data integrity
+and consistency with other model tables.
+
+AequilibraE provides full support for OMX matrices, which can be used as input
+for any AequilibraE procedure, and makes its outputs, particularly skim matrices 
+readily available to other modeling activities.
+
+AequilibraE includes multi-class user-equilibrium assignment with full support
+for class-specific networks, value-of-time and generalized cost functions, and 
+includes a range of equilibration algorithms, including MSA, the traditional 
+Frank-Wolfe as well as the state-of-the-art Bi-conjugate Frank-Wolfe.
+
+AequilibraE's support for public transport includes a GTFS importer that can 
+map-match routes into the model network and an optimized version of the
+traditional "Optimal-Strategies" transit assignment, and full support in the data 
+model for other schedule-based assignments to be implemented in the future.
+
+State-of-the-art computational performance and full multi-threading can be 
+expected from all key algorithms in AequilibraE, from cache-optimized IPF, 
+to path-computation based on sophisticated data structures and cascading network
+loading, which all ensure that AequilibraE performs at par with the best
+commercial packages current available on the market.
+
+AequilibraE has also a Graphical Interface for the popular GIS package QGIS, 
+which gives access to most AequilibraE procedures and includes a wide range of
+visualization tools, such as flow maps, desire and delaunay lines, scenario 
+comparison, matrix visualization, etc. This GUI, called QAequilibraE, is 
+currently available in English, French and Portuguese and more languages are
+continuously being added, which is another substantial point of difference from 
+commercial packages.
+
+Finally, AequilibraE is developed 100% in the open and incorporates software-development 
+best practices for testing and documentation. AequilibraE's testing includes all 
+major operating systems (Windows, Linux and MacOS) and all currently supported versions
+of Python. AequilibraE is also supported on ARM-based cloud computation nodes, making 
+cloud deployments substantially less expensive.
 
 ## Comprehensive documentation
 
 [AequilibraE documentation built with Sphinx ](http://www.aequilibrae.com)
 
-## What is available
-
-* Importing networks from OSM
-* Synthetic gravity/IPF
-* Traffic assignment (All-or Nothing, MSA, Frank-Wolfe, Conjugate Frank-Wolfe & Biconjugate-FrankWolfe)
-* Network Skimming & node-to-node path computation
-* Fast Matrix format based on NumPy
-* GTFS Import
 
 ### What is available only in QGIS
 
@@ -37,62 +80,5 @@ Some common resources for transportation modeling are inherently visual, and the
 available within a GIS platform. For that reason, many resources are available only from AequilibraE's 
 [QGIS plugin](http://plugins.qgis.org/plugins/qaequilibrae/),
 which uses AequilibraE as its computational workhorse and also provides GUIs for most of AequilibraE's tools. Said tool
-is developed independently, although in parallel, and more details can be found in its 
+is developed independently and a little delayed with relationship to the Python package, and more details can be found in its 
 [GitHub repository](https://github.com/AequilibraE/qaequilibrae).
-
-
-### What is not planned to be available any time soon
-
-As AequilibraE's focus is to provide resources that are not yet available in the open source world, particularly the
-Python ecosystem, some important tools for transportation model won't be part of AequilibraE any time soon. Examples
-of this are:
-
-    * Discrete choice models - [BIOEGEME](http://biogeme.epfl.ch) , [LARCH](http://larch.newman.me)
-
-    * Activity-Based models - [ActivitySim](http://www.activitysim.org)
-
-## History
-
-Before there was AequilibraE, there was a need for something like AequilibraE out there.
-
-### The very early days
-
-It all started when I was a student at [UCI-ITS](www.its.uci.edu) and needed low level access to outputs of standard
-algorithms used in transportation modeling (e.g. path files from traffic assignment) and had that denied by the maker
-of the commercial software he normally used. There, the [first scratch of a traffic assignment procedure](www.xl-optim.com/python-traffic-assignment) was born.
-After that, there were a couple of scripts developed to implement synthetic gravity models (calibration and application)
-that were develop for a government think-tank in Brazil [IPEA](www.ipea.gov.br).
-Around the same time, another student needed a piece of code that transformed a GIS link layer into a proper graph,
-where each link would become the connection between two nodes.
-So there were three fundamental pieces that would come to be part of AequilibraE.
-
-### The first take on a release software
-
-Having all those algorithms at hand, it made sense combining them into something more people could use, and by them it
-seemed that QGIS was the way to go, so I developed the [very first version of AequilibraE](http://www.xl-optim.com/introducing_aequilibrae).
-
-It was buggy as hell and there was very little, if any, software engineering built into it, but it put Aequilibrae on
-the map.
-
-### The first reasonable version
-
-The first important thing I noticed after releasing AequilibraE was that the code was written in procedural style, even
-though it would make a lot more sense doing it in a Object-Oriented fashion, which let me down the path of creating the
-objects (graph, assignment results, matrix) that the software still relies on and were the foundation blocks of the
-proper API that is in the making. That [version was release in 2016](http://www.xl-optim.com/new-version-of-aequilibrae).
-
-### Evolving into proper software
-
-
-A few distinct improvements deserve to be highlighted.
-
-* The separation of the GUI and the Python library in [two repositories](http://www.xl-optim.com/separating-the-women-from-the-girls)
-* Introduction of Unit Tests and automatic testing using [Travis (replaced with GitHub Actions)](https://travis-ci.org/AequilibraE/aequilibrae)
-* Welcome of new collaborators: Jamie Cook, Andrew O'Brien, Yu-Chu Huang & Jan Zill
-* Introduction of style-checking with Flake8 and Black
-* Development of proper documentation and a recommended development virtual environment
-
-# QGIS Plugin
-
-The QGIS plugin is developed on a separate repository: [QGIS GUI](https://github.com/AequilibraE/qaequilibrae) 
-That is where everything started.

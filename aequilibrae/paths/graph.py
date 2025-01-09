@@ -1,17 +1,36 @@
-from os.path import join
 import pickle
 import uuid
+from abc import ABC
 from datetime import datetime
-from typing import List, Tuple
+from os.path import join
+from typing import List, Tuple, Optional
+
 import numpy as np
 import pandas as pd
+from aequilibrae.paths.graph_building import build_compressed_graph
+
 from aequilibrae.context import get_logger
-from aequilibrae.paths.AoN import build_compressed_graph
 
 
-class Graph(object):
+class GraphBase(ABC):  # noqa: B024
     """
-    Graph class
+    Graph class.
+
+    AequilibraE graphs implement two forms of compression.
+        - link contraction, and
+        - dead end removal.
+
+    Link contraction creates a topological equivalent graph by contracting sequences of links between nodes
+    with degrees of two. This compresses long streams of links, such as along highways or curved roads, into single links.
+
+    Dead end removal attempts to remove dead ends and fish spines from the network. It does this based on the observation
+    that in a graph with non-negative weights a dead end will over ever appear in the results of a short(est) path if the
+    origin or destination is present within that dead end.
+
+    Dead end removal is applied before link contraction and does not create a strictly topological equivalent graph,
+    however, all centroids are preserved.
+
+    The compressed graph is used internally.
     """
 
     def __init__(self, logger=None):
@@ -47,10 +66,12 @@ class Graph(object):
 
         # These are the fields actually used in computing paths
         self.all_nodes = np.array(0)  # Holds an array with all nodes in the original network
-        self.nodes_to_indices = np.array(0)  # Holds the reverse of the all_nodes
+        self.nodes_to_indices = np.array(0, np.int64)  # Holds the reverse of the all_nodes
         self.fs = np.array([])  # This method will hold the forward star for the graph
         self.cost = np.array([])  # This array holds the values being used in the shortest path routine
         self.skims = None
+
+        self.lonlat_index = pd.DataFrame([])  # Holds a node_id to lon/lat coord index for nodes within this graph
 
         self.compact_all_nodes = np.array(0)  # Holds an array with all nodes in the original network
         self.compact_nodes_to_indices = np.array(0)  # Holds the reverse of the all_nodes
@@ -72,8 +93,10 @@ class Graph(object):
 
         self.g_link_crosswalk = np.array([])  # 4 a link ID in the BIG graph, a corresponding link in the compressed 1
 
+        self.dead_end_links = np.array([])
+
         # Randomly generate a unique Graph ID randomly
-        self.__id__ = uuid.uuid4().hex
+        self._id = uuid.uuid4().hex
 
     def default_types(self, tp: str):
         """
@@ -89,7 +112,7 @@ class Graph(object):
         else:
             raise ValueError("It must be either a int or a float")
 
-    def prepare_graph(self, centroids: np.ndarray) -> None:
+    def prepare_graph(self, centroids: Optional[np.ndarray]) -> None:
         """
         Prepares the graph for a computation for a certain set of centroids
 
@@ -107,17 +130,18 @@ class Graph(object):
 
         # Creates the centroids
 
-        if centroids is None or not isinstance(centroids, np.ndarray):
-            raise ValueError("Centroids need to be a NumPy array of integers 64 bits")
-        if not np.issubdtype(centroids.dtype, np.integer):
-            raise ValueError("Centroids need to be a NumPy array of integers 64 bits")
-        if centroids.shape[0] == 0:
-            raise ValueError("You need at least one centroid")
-        if centroids.min() <= 0:
-            raise ValueError("Centroid IDs need to be positive")
-        if centroids.shape[0] != np.unique(centroids).shape[0]:
-            raise ValueError("Centroid IDs are not unique")
-        self.centroids = np.array(centroids, np.uint32)
+        if centroids is not None:
+            if not np.issubdtype(centroids.dtype, np.integer):
+                raise ValueError("Centroids need to be a NumPy array of integers 64 bits")
+            if centroids.shape[0] == 0:
+                raise ValueError("You need at least one centroid")
+            if centroids.min() <= 0:
+                raise ValueError("Centroid IDs need to be positive")
+            if centroids.shape[0] != np.unique(centroids).shape[0]:
+                raise ValueError("Centroid IDs are not unique")
+            self.centroids = np.array(centroids, np.uint32)
+        else:
+            self.centroids = np.array([], np.uint32)
 
         self.network = self.network.astype(
             {
@@ -128,7 +152,7 @@ class Graph(object):
             }
         )
 
-        properties = self.__build_directed_graph(self.network, centroids)
+        properties = self._build_directed_graph(self.network, self.centroids)
         self.all_nodes, self.num_nodes, self.nodes_to_indices, self.fs, self.graph = properties
 
         # We generate IDs that we KNOW will be constant across modes
@@ -139,8 +163,9 @@ class Graph(object):
         self.num_links = self.graph.shape[0]
         self.__build_derived_properties()
 
-        self.__build_compressed_graph()
-        self.compact_num_links = self.compact_graph.shape[0]
+        if self.centroids.shape[0]:
+            self.__build_compressed_graph()
+            self.compact_num_links = self.compact_graph.shape[0]
 
     def __build_compressed_graph(self):
         build_compressed_graph(self)
@@ -148,7 +173,7 @@ class Graph(object):
         # We build a groupby to save time later
         self.__graph_groupby = self.graph.groupby(["__compressed_id__"])
 
-    def __build_directed_graph(self, network: pd.DataFrame, centroids: np.ndarray):
+    def _build_directed_graph(self, network: pd.DataFrame, centroids: np.ndarray):
         all_titles = list(network.columns)
 
         not_pos = network.loc[network.direction != 1, :]
@@ -163,6 +188,8 @@ class Graph(object):
                 neg_names.append(name + "_ba")
         not_pos = pd.DataFrame(not_pos, copy=True)[neg_names]
         not_pos.columns = names
+
+        # Swap the a and b nodes of these edges. Direction is used for mapping the graph.graph back to the network. It does not indicate the direction of the link.
         not_pos.loc[:, "direction"] = -1
         aux = np.array(not_pos.a_node.values, copy=True)
         not_pos.loc[:, "a_node"] = not_pos.loc[:, "b_node"]
@@ -188,7 +215,7 @@ class Graph(object):
 
         num_nodes = all_nodes.shape[0]
 
-        nodes_to_indices = np.repeat(-1, int(all_nodes.max()) + 1)
+        nodes_to_indices = np.full(int(all_nodes.max()) + 1, -1, dtype=np.int64)
         nlist = np.arange(num_nodes)
         nodes_to_indices[all_nodes] = nlist
 
@@ -234,11 +261,11 @@ class Graph(object):
         if self.centroids is not None:
             self.prepare_graph(self.centroids)
             self.set_blocked_centroid_flows(self.block_centroid_flows)
-        self.__id__ = uuid.uuid4().hex
+        self._id = uuid.uuid4().hex
 
     def __build_column_names(self, all_titles: List[str]) -> Tuple[list, list]:
-        fields = [x for x in self.required_default_fields]
-        types = [x for x in self.__required_default_types]
+        fields = list(self.required_default_fields)
+        types = list(self.__required_default_types)
         for column in all_titles:
             if column not in self.required_default_fields and column[0:-3] not in self.required_default_fields:
                 if column[-3:] == "_ab":
@@ -302,6 +329,8 @@ class Graph(object):
     def set_skimming(self, skim_fields: list) -> None:
         """
         Sets the list of skims to be computed
+
+        Skimming with A* may produce results that differ from tradditional Dijkstra's due to its use a heuristic.
 
         :Arguments:
             **skim_fields** (:obj:`list`): Fields must be numeric
@@ -376,7 +405,7 @@ class Graph(object):
         mygraph["skim_fields"] = self.skim_fields
         mygraph["block_centroid_flows"] = self.block_centroid_flows
         mygraph["centroids"] = self.centroids
-        mygraph["graph_id"] = self.__id__
+        mygraph["graph_id"] = self._id
         mygraph["mode"] = self.mode
 
         with open(filename, "wb") as f:
@@ -406,7 +435,7 @@ class Graph(object):
             self.skim_fields = mygraph["skim_fields"]
             self.block_centroid_flows = mygraph["block_centroid_flows"]
             self.centroids = mygraph["centroids"]
-            self.__id__ = mygraph["graph_id"]
+            self._id = mygraph["graph_id"]
             self.mode = mygraph["mode"]
         self.__build_derived_properties()
 
@@ -453,19 +482,17 @@ class Graph(object):
                 new_type = float(new_type)
             except ValueError as verr:
                 self.logger.warning("Could not convert {} - {}".format(new_type, verr.__str__()))
-        nt = type(new_type)
-        def_type = None
-        if nt == int:
+        if isinstance(new_type, int):
             def_type = int
             if current_type == float:
-                def_type == float
+                def_type = float
             elif current_type == str:
                 def_type = str
-        elif nt == float:
+        elif isinstance(new_type, float):
             def_type = float
             if current_type == str:
                 def_type = str
-        elif nt == str:
+        elif isinstance(new_type, str):
             def_type = str
         else:
             raise ValueError("WRONG TYPE OR NULL VALUE")
@@ -477,3 +504,16 @@ class Graph(object):
         self.graph.to_feather(graph_path)
         node_path = join(path, f"nodes_to_indices_c{mode_name}_{mode_id}.feather")
         pd.DataFrame(self.nodes_to_indices, columns=["node_index"]).to_feather(node_path)
+
+
+class Graph(GraphBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+
+class TransitGraph(GraphBase):
+    def __init__(self, config: dict = None, od_node_mapping: pd.DataFrame = None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._config = config
+        self.od_node_mapping = od_node_mapping
+        self.mode = "t"

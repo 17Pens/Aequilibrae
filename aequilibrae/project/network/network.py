@@ -3,12 +3,13 @@ import math
 from sqlite3 import Connection as sqlc
 from typing import Dict
 from pathlib import Path
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
 import shapely.wkb
 import shapely.wkt
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
 
 from aequilibrae.context import get_logger
@@ -26,8 +27,14 @@ from aequilibrae.project.network.nodes import Nodes
 from aequilibrae.project.network.osm_builder import OSMBuilder
 # from aequilibrae.project.network.ovm_builder import OVMBuilder
 from aequilibrae.project.network.osm_utils.place_getter import placegetter
+from aequilibrae.project.network.osm.osm_builder import OSMBuilder
+from aequilibrae.project.network.osm.osm_downloader import OSMDownloader
+from aequilibrae.project.network.osm.place_getter import placegetter
+from aequilibrae.project.network.periods import Periods
 from aequilibrae.project.project_creation import req_link_flds, req_node_flds, protected_fields
 from aequilibrae.utils import WorkerThread
+from aequilibrae.utils.db_utils import commit_and_close
+from aequilibrae.utils.spatialite_utils import connect_spatialite
 
 spec = iutil.find_spec("PyQt5")
 pyqt = spec is not None
@@ -52,8 +59,6 @@ class Network(WorkerThread):
         from aequilibrae.paths import Graph
 
         WorkerThread.__init__(self, None)
-        self.conn = project.conn  # type: sqlc
-        self.source = project.source  # type: sqlc
         self.graphs = {}  # type: Dict[Graph]
         self.project = project
         self.logger = project.logger
@@ -61,6 +66,7 @@ class Network(WorkerThread):
         self.link_types = LinkTypes(self)
         self.links = Links(self)
         self.nodes = Nodes(self)
+        self.periods = Periods(self)
 
     def skimmable_fields(self):
         """
@@ -69,11 +75,11 @@ class Network(WorkerThread):
         :Returns:
             :obj:`list`: List of all fields that can be skimmed
         """
-        curr = self.conn.cursor()
-        curr.execute("PRAGMA table_info(links);")
-        field_names = curr.fetchall()
-        ignore_fields = ["ogc_fid", "geometry"] + self.req_link_flds
 
+        with commit_and_close(connect_spatialite(self.project.path_to_file)) as conn:
+            field_names = conn.execute("PRAGMA table_info(links);").fetchall()
+
+        ignore_fields = ["ogc_fid", "geometry"] + self.req_link_flds
         skimmable = [
             "INT",
             "INTEGER",
@@ -119,9 +125,10 @@ class Network(WorkerThread):
         :Returns:
             :obj:`list`: List of all modes
         """
-        curr = self.conn.cursor()
-        curr.execute("""select mode_id from modes""")
-        return [x[0] for x in curr.fetchall()]
+
+        with commit_and_close(connect_spatialite(self.project.path_to_file)) as conn:
+            all_modes = [x[0] for x in conn.execute("""select mode_id from modes""").fetchall()]
+        return all_modes
 
     def create_from_ovm(
         self,
@@ -213,27 +220,22 @@ class Network(WorkerThread):
 
     def create_from_osm(
         self,
-        west: float = None,
-        south: float = None,
-        east: float = None,
-        north: float = None,
-        place_name: str = None,
-        modes=["car", "transit", "bicycle", "walk"],
+        model_area: Optional[Polygon] = None,
+        place_name: Optional[str] = None,
+        modes=("car", "transit", "bicycle", "walk"),
     ) -> None:
         """
         Downloads the network from Open-Street Maps
 
         :Arguments:
-            **west** (:obj:`float`, Optional): West most coordinate of the download bounding box
 
-            **south** (:obj:`float`, Optional): South most coordinate of the download bounding box
-
-            **east** (:obj:`float`, Optional): East most coordinate of the download bounding box
+            **area** (:obj:`Polygon`, Optional): Polygon for which the network will be downloaded. If not provided,
+            a place name would be required
 
             **place_name** (:obj:`str`, Optional): If not downloading with East-West-North-South boundingbox, this is
             required
 
-            **modes** (:obj:`list`, Optional): List of all modes to be downloaded. Defaults to the modes in the parameter
+            **modes** (:obj:`tuple`, Optional): List of all modes to be downloaded. Defaults to the modes in the parameter
             file
 
         .. code-block:: python
@@ -265,10 +267,9 @@ class Network(WorkerThread):
         if self.count_links() > 0:
             raise FileExistsError("You can only import an OSM network into a brand new model file")
 
-        curr = self.conn.cursor()
-        curr.execute("""ALTER TABLE links ADD COLUMN osm_id integer""")
-        curr.execute("""ALTER TABLE nodes ADD COLUMN osm_id integer""")
-        self.conn.commit()
+        with commit_and_close(connect_spatialite(self.project.path_to_file)) as conn:
+            conn.execute("""ALTER TABLE links ADD COLUMN osm_id integer""")
+            conn.execute("""ALTER TABLE nodes ADD COLUMN osm_id integer""")
 
         if isinstance(modes, (tuple, list)):
             modes = list(modes)
@@ -278,12 +279,16 @@ class Network(WorkerThread):
             raise ValueError("'modes' needs to be string or list/tuple of string")
 
         if place_name is None:
-            if min(east, west) < -180 or max(east, west) > 180 or min(north, south) < -90 or max(north, south) > 90:
-                raise ValueError("Coordinates out of bounds")
-            bbox = [west, south, east, north]
+            if (
+                model_area.bounds[0] < -180
+                or model_area.bounds[2] > 180
+                or model_area.bounds[1] < -90
+                or model_area.bounds[3] > 90
+            ):
+                raise ValueError("Coordinates out of bounds. Polygon must be in WGS84")
+            west, south, east, north = model_area.bounds
         else:
             bbox, report = placegetter(place_name)
-            west, south, east, north = bbox
             if bbox is None:
                 msg = f'We could not find a reference for place name "{place_name}"'
                 self.logger.warning(msg)
@@ -291,6 +296,8 @@ class Network(WorkerThread):
             for i in report:
                 if "PLACE FOUND" in i:
                     self.logger.info(i)
+            model_area = box(*bbox)
+            west, south, east, north = bbox
 
         # Need to compute the size of the bounding box to not exceed it too much
         height = haversine((east + west) / 2, south, (east + west) / 2, north)
@@ -301,7 +308,7 @@ class Network(WorkerThread):
         max_query_area_size = par["max_query_area_size"]
 
         if area < max_query_area_size:
-            polygons = [bbox]
+            polygons = [model_area]
         else:
             polygons = []
             parts = math.ceil(area / max_query_area_size)
@@ -315,8 +322,9 @@ class Network(WorkerThread):
                 for j in range(vertical):
                     ymin = max(-90, south + j * dy)
                     ymax = min(90, south + (j + 1) * dy)
-                    box = [xmin, ymin, xmax, ymax]
-                    polygons.append(box)
+                    subarea = box(xmin, ymin, xmax, ymax)
+                    if subarea.intersects(model_area):
+                        polygons.append(subarea)
         self.logger.info("Downloading data")
         self.downloader = OSMDownloader(polygons, modes, logger=self.logger)
         if pyqt:
@@ -325,7 +333,7 @@ class Network(WorkerThread):
         self.downloader.doWork()
 
         self.logger.info("Building Network")
-        self.builder = OSMBuilder(self.downloader.json, self.source, project=self.project)
+        self.builder = OSMBuilder(self.downloader.json, project=self.project, model_area=model_area)
 
         if pyqt:
             self.builder.building.connect(self.signal_handler)
@@ -405,31 +413,31 @@ class Network(WorkerThread):
         """
         from aequilibrae.paths import Graph
 
-        curr = self.conn.cursor()
+        with commit_and_close(connect_spatialite(self.project.path_to_file)) as conn:
+            if fields is None:
+                field_names = conn.execute("PRAGMA table_info(links);").fetchall()
 
-        if fields is None:
-            curr.execute("PRAGMA table_info(links);")
-            field_names = curr.fetchall()
+                ignore_fields = ["ogc_fid", "geometry"]
+                all_fields = [f[1] for f in field_names if f[1] not in ignore_fields]
+            else:
+                fields.extend(["link_id", "a_node", "b_node", "direction", "modes"])
+                all_fields = list(set(fields))
 
-            ignore_fields = ["ogc_fid", "geometry"]
-            all_fields = [f[1] for f in field_names if f[1] not in ignore_fields]
-        else:
-            fields.extend(["link_id", "a_node", "b_node", "direction", "modes"])
-            all_fields = list(set(fields))
+            if modes is None:
+                modes = conn.execute("select mode_id from modes;").fetchall()
+                modes = [m[0] for m in modes]
+            elif isinstance(modes, str):
+                modes = [modes]
 
-        if modes is None:
-            modes = curr.execute("select mode_id from modes;").fetchall()
-            modes = [m[0] for m in modes]
-        elif isinstance(modes, str):
-            modes = [modes]
+            sql = f"select {','.join(all_fields)} from links"
 
-        sql = f"select {','.join(all_fields)} from links"
+            df = pd.read_sql(sql, conn).fillna(value=np.nan)
+            valid_fields = list(df.select_dtypes(np.number).columns) + ["modes"]
+            sql = "select node_id from nodes where is_centroid=1 order by node_id;"
+            centroids = np.array([i[0] for i in conn.execute(sql).fetchall()], np.uint32)
+            centroids = centroids if centroids.shape[0] else None
 
-        df = pd.read_sql(sql, self.conn).fillna(value=np.nan)
-        valid_fields = list(df.select_dtypes(np.number).columns) + ["modes"]
-        curr.execute("select node_id from nodes where is_centroid=1 order by node_id;")
-        centroids = np.array([i[0] for i in curr.fetchall()], np.uint32)
-
+        lonlat = self.nodes.lonlat.set_index("node_id")
         data = df[valid_fields]
         for m in modes:
             net = pd.DataFrame(data, copy=True)
@@ -437,11 +445,11 @@ class Network(WorkerThread):
             g = Graph()
             g.mode = m
             g.network = net
-            if centroids.shape[0]:
-                g.prepare_graph(centroids)
-                g.set_blocked_centroid_flows(True)
-            else:
+            g.prepare_graph(centroids)
+            g.set_blocked_centroid_flows(True)
+            if centroids is None:
                 get_logger().warning("Your graph has no centroids")
+            g.lonlat_index = lonlat.loc[g.all_nodes]
             self.graphs[m] = g
 
     def set_time_field(self, time_field: str) -> None:
@@ -491,9 +499,8 @@ class Network(WorkerThread):
         :Returns:
             **model extent** (:obj:`Polygon`): Shapely polygon with the bounding box of the model network.
         """
-        curr = self.conn.cursor()
-        curr.execute('Select ST_asBinary(GetLayerExtent("Links"))')
-        poly = shapely.wkb.loads(curr.fetchone()[0])
+        with commit_and_close(connect_spatialite(self.project.path_to_file)) as conn:
+            poly = shapely.wkb.loads(conn.execute('Select ST_asBinary(GetLayerExtent("Links"))').fetchone()[0])
         return poly
 
     def convex_hull(self) -> Polygon:
@@ -502,15 +509,12 @@ class Network(WorkerThread):
         :Returns:
             **model coverage** (:obj:`Polygon`): Shapely (Multi)polygon of the model network.
         """
-        curr = self.conn.cursor()
-        curr.execute('Select ST_asBinary("geometry") from Links where ST_Length("geometry") > 0;')
-        links = [shapely.wkb.loads(x[0]) for x in curr.fetchall()]
+        with commit_and_close(connect_spatialite(self.project.path_to_file)) as conn:
+            sql = 'Select ST_asBinary("geometry") from Links where ST_Length("geometry") > 0;'
+            links = [shapely.wkb.loads(x[0]) for x in conn.execute(sql).fetchall()]
         return unary_union(links).convex_hull
 
-    def refresh_connection(self):
-        """Opens a new database connection to avoid thread conflict"""
-        self.conn = self.project.connect()
-
     def __count_items(self, field: str, table: str, condition: str) -> int:
-        c = self.conn.execute(f"select count({field}) from {table} where {condition};").fetchone()[0]
+        with commit_and_close(connect_spatialite(self.project.path_to_file)) as conn:
+            c = conn.execute(f"select count({field}) from {table} where {condition};").fetchone()[0]
         return c

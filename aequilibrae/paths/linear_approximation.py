@@ -12,7 +12,6 @@ from aequilibrae import global_logger
 from aequilibrae.paths.all_or_nothing import allOrNothing
 from aequilibrae.paths.results import AssignmentResults
 from aequilibrae.paths.traffic_class import TrafficClass
-from aequilibrae.context import get_active_project
 from ..utils import WorkerThread
 
 try:
@@ -123,32 +122,23 @@ class LinearApproximation(WorkerThread):
 
         self.step_direction = {}  # type: Dict[AssignmentResults]
         self.previous_step_direction = {}  # type: Dict[AssignmentResults]
-        self.pre_previous_step_direction = {}  # type: Dict[AssignmentResults]
+        self.temp_step_direction_for_copy = {}  # type: Dict[AssignmentResults]
+
+        self.aons = {}
 
         for c in self.traffic_classes:
             r = AssignmentResults()
             r.prepare(c.graph, c.matrix)
-            self.step_direction[c.__id__] = r
+            self.step_direction[c._id] = r
 
         if self.algorithm in ["cfw", "bfw"]:
             for c in self.traffic_classes:
-                r = AssignmentResults()
-                r.prepare(c.graph, c.matrix)
-                r.compact_link_loads = np.zeros([])
-                r.compact_total_link_loads = np.zeros([])
-                self.previous_step_direction[c.__id__] = r
-
-                r = AssignmentResults()
-                r.prepare(c.graph, c.matrix)
-                r.compact_link_loads = np.zeros([])
-                r.compact_total_link_loads = np.zeros([])
-                self.step_direction[c.__id__] = r
-
-                r = AssignmentResults()
-                r.prepare(c.graph, c.matrix)
-                r.compact_link_loads = np.zeros([])
-                r.compact_total_link_loads = np.zeros([])
-                self.pre_previous_step_direction[c.__id__] = r
+                for d in [self.step_direction, self.previous_step_direction, self.temp_step_direction_for_copy]:
+                    r = AssignmentResults()
+                    r.prepare(c.graph, c.matrix)
+                    r.compact_link_loads = np.zeros([])
+                    r.compact_total_link_loads = np.zeros([])
+                    d[c._id] = r
 
     def calculate_conjugate_stepsize(self):
         self.vdf.apply_derivative(
@@ -161,17 +151,15 @@ class LinearApproximation(WorkerThread):
         aon_minus_prev_dir = {}
 
         for c in self.traffic_classes:
-            stp_dir = self.step_direction[c.__id__]
-            prev_dir_minus_current_sol[c.__id__] = np.sum(stp_dir.link_loads[:, :] - c.results.link_loads[:, :], axis=1)
-            aon_minus_current_sol[c.__id__] = np.sum(
-                c._aon_results.link_loads[:, :] - c.results.link_loads[:, :], axis=1
-            )
-            aon_minus_prev_dir[c.__id__] = np.sum(c._aon_results.link_loads[:, :] - stp_dir.link_loads[:, :], axis=1)
+            stp_dir = self.step_direction[c._id]
+            prev_dir_minus_current_sol[c._id] = np.sum(stp_dir.link_loads[:, :] - c.results.link_loads[:, :], axis=1)
+            aon_minus_current_sol[c._id] = np.sum(c._aon_results.link_loads[:, :] - c.results.link_loads[:, :], axis=1)
+            aon_minus_prev_dir[c._id] = np.sum(c._aon_results.link_loads[:, :] - stp_dir.link_loads[:, :], axis=1)
 
         for c_0 in self.traffic_classes:
             for c_1 in self.traffic_classes:
-                numerator += prev_dir_minus_current_sol[c_0.__id__] * aon_minus_current_sol[c_1.__id__]
-                denominator += prev_dir_minus_current_sol[c_0.__id__] * aon_minus_prev_dir[c_1.__id__]
+                numerator += prev_dir_minus_current_sol[c_0._id] * aon_minus_current_sol[c_1._id]
+                denominator += prev_dir_minus_current_sol[c_0._id] * aon_minus_prev_dir[c_1._id]
 
         numerator = np.sum(numerator * self.vdf_der)
         denominator = np.sum(denominator * self.vdf_der)
@@ -205,21 +193,21 @@ class LinearApproximation(WorkerThread):
         z_ = {}
 
         for c in self.traffic_classes:
-            sd = self.step_direction[c.__id__].link_loads[:, :]
-            psd = self.previous_step_direction[c.__id__].link_loads[:, :]
+            sd = self.step_direction[c._id].link_loads[:, :]
+            psd = self.previous_step_direction[c._id].link_loads[:, :]
             ll = c.results.link_loads[:, :]
 
-            x_[c.__id__] = np.sum(sd * self.stepsize + psd * (1.0 - self.stepsize) - ll, axis=1)
-            y_[c.__id__] = np.sum(c._aon_results.link_loads[:, :] - ll, axis=1)
-            z_[c.__id__] = np.sum(sd - ll, axis=1)
-            w_[c.__id__] = np.sum(psd - sd, axis=1)
+            x_[c._id] = np.sum(sd * self.stepsize + psd * (1.0 - self.stepsize) - ll, axis=1)
+            y_[c._id] = np.sum(c._aon_results.link_loads[:, :] - ll, axis=1)
+            z_[c._id] = np.sum(sd - ll, axis=1)
+            w_[c._id] = np.sum(psd - sd, axis=1)
 
         for c_0 in self.traffic_classes:
             for c_1 in self.traffic_classes:
-                mu_numerator += x_[c_0.__id__] * y_[c_1.__id__]
-                mu_denominator += x_[c_0.__id__] * w_[c_1.__id__]
-                nu_nom += z_[c_0.__id__] * y_[c_1.__id__]
-                nu_denom += z_[c_0.__id__] * z_[c_1.__id__]
+                mu_numerator += x_[c_0._id] * y_[c_1._id]
+                mu_denominator += x_[c_0._id] * w_[c_1._id]
+                nu_nom += z_[c_0._id] * y_[c_1._id]
+                nu_denom += z_[c_0._id] * z_[c_1._id]
 
         mu_numerator = np.sum(mu_numerator * self.vdf_der)
         mu_denominator = np.sum(mu_denominator * self.vdf_der)
@@ -253,24 +241,39 @@ class LinearApproximation(WorkerThread):
             self.conjugate_stepsize = 0.0
             for c in self.traffic_classes:
                 aon_res = c._aon_results
-                stp_dir_res = self.step_direction[c.__id__]
+                stp_dir_res = self.step_direction[c._id]
                 copy_two_dimensions(stp_dir_res.link_loads, aon_res.link_loads, self.cores)
                 stp_dir_res.total_flows()
                 if c.results.num_skims > 0:
                     copy_three_dimensions(stp_dir_res.skims.matrix_view, aon_res.skims.matrix_view, self.cores)
                 sd_flows.append(aon_res.total_link_loads)
 
+                if c._selected_links:
+                    aux_res = self.aons[c._id].aux_res
+                    for name, idx in c._aon_results._selected_links.items():
+                        copy_two_dimensions(
+                            self.sl_step_dir_ll[c._id][name]["sdr"],
+                            np.sum(aux_res.temp_sl_link_loading, axis=0)[idx, :, :],
+                            self.cores,
+                        )
+                        copy_three_dimensions(
+                            self.sl_step_dir_od[c._id][name]["sdr"],
+                            np.sum(aux_res.temp_sl_od_matrix, axis=0)[idx, :, :, :],
+                            self.cores,
+                        )
+
         # 3rd iteration is cfw. also, if we had to reset direction search we need a cfw step before bfw
         elif (self.iter == 3) or (self.do_conjugate_step) or (self.algorithm == "cfw"):
             self.do_conjugate_step = False
             self.calculate_conjugate_stepsize()
             for c in self.traffic_classes:
-                sdr = self.step_direction[c.__id__]
-                pre_previous = self.pre_previous_step_direction[c.__id__]
-                copy_two_dimensions(pre_previous.link_loads, sdr.link_loads, self.cores)
-                pre_previous.total_flows()
+                sdr = self.step_direction[c._id]
+                previous = self.previous_step_direction[c._id]
+
+                copy_two_dimensions(previous.link_loads, sdr.link_loads, self.cores)
+                previous.total_flows()
                 if c.results.num_skims > 0:
-                    copy_three_dimensions(pre_previous.skims.matrix_view, sdr.skims.matrix_view, self.cores)
+                    copy_three_dimensions(previous.skims.matrix_view, sdr.skims.matrix_view, self.cores)
 
                 linear_combination(
                     sdr.link_loads, sdr.link_loads, c._aon_results.link_loads, self.conjugate_stepsize, self.cores
@@ -285,6 +288,39 @@ class LinearApproximation(WorkerThread):
                         self.cores,
                     )
 
+                if c._selected_links:
+                    aux_res = self.aons[c._id].aux_res
+                    for name, idx in c._aon_results._selected_links.items():
+                        sl_step_dir_ll = self.sl_step_dir_ll[c._id][name]
+                        sl_step_dir_od = self.sl_step_dir_od[c._id][name]
+
+                        copy_two_dimensions(
+                            sl_step_dir_ll["prev_sdr"],
+                            sl_step_dir_ll["sdr"],
+                            self.cores,
+                        )
+                        copy_three_dimensions(
+                            sl_step_dir_od["prev_sdr"],
+                            sl_step_dir_od["sdr"],
+                            self.cores,
+                        )
+
+                        linear_combination(
+                            sl_step_dir_ll["sdr"],
+                            sl_step_dir_ll["sdr"],
+                            np.sum(aux_res.temp_sl_link_loading, axis=0)[idx, :, :],
+                            self.conjugate_stepsize,
+                            self.cores,
+                        )
+
+                        linear_combination_skims(
+                            sl_step_dir_od["sdr"],
+                            sl_step_dir_od["sdr"],
+                            np.sum(aux_res.temp_sl_od_matrix, axis=0)[idx, :, :, :],
+                            self.conjugate_stepsize,
+                            self.cores,
+                        )
+
                 sdr.total_flows()
                 sd_flows.append(sdr.total_link_loads)
         # biconjugate
@@ -292,9 +328,9 @@ class LinearApproximation(WorkerThread):
             self.calculate_biconjugate_direction()
             # deep copy because we overwrite step_direction but need it on next iteration
             for c in self.traffic_classes:
-                ppst = self.pre_previous_step_direction[c.__id__]  # type: AssignmentResults
-                prev_stp_dir = self.previous_step_direction[c.__id__]  # type: AssignmentResults
-                stp_dir = self.step_direction[c.__id__]  # type: AssignmentResults
+                ppst = self.temp_step_direction_for_copy[c._id]  # type: AssignmentResults
+                prev_stp_dir = self.previous_step_direction[c._id]  # type: AssignmentResults
+                stp_dir = self.step_direction[c._id]  # type: AssignmentResults
 
                 copy_two_dimensions(ppst.link_loads, stp_dir.link_loads, self.cores)
                 ppst.total_flows()
@@ -321,6 +357,51 @@ class LinearApproximation(WorkerThread):
                         self.cores,
                     )
 
+                if c._selected_links:
+                    aux_res = self.aons[c._id].aux_res
+                    for name, idx in c._aon_results._selected_links.items():
+                        sl_step_dir_ll = self.sl_step_dir_ll[c._id][name]
+                        sl_step_dir_od = self.sl_step_dir_od[c._id][name]
+                        copy_two_dimensions(
+                            sl_step_dir_ll["temp_prev_sdr"],
+                            sl_step_dir_ll["sdr"],
+                            self.cores,
+                        )
+                        copy_three_dimensions(
+                            sl_step_dir_od["temp_prev_sdr"],
+                            sl_step_dir_od["sdr"],
+                            self.cores,
+                        )
+
+                        triple_linear_combination(
+                            sl_step_dir_ll["sdr"],
+                            np.sum(aux_res.temp_sl_link_loading, axis=0)[idx, :, :],
+                            sl_step_dir_ll["sdr"],
+                            sl_step_dir_ll["prev_sdr"],
+                            self.betas,
+                            self.cores,
+                        )
+
+                        triple_linear_combination_skims(
+                            sl_step_dir_od["sdr"],
+                            np.sum(aux_res.temp_sl_od_matrix, axis=0)[idx, :, :, :],
+                            sl_step_dir_od["sdr"],
+                            sl_step_dir_od["prev_sdr"],
+                            self.betas,
+                            self.cores,
+                        )
+
+                        copy_two_dimensions(
+                            sl_step_dir_ll["prev_sdr"],
+                            sl_step_dir_ll["temp_prev_sdr"],
+                            self.cores,
+                        )
+                        copy_three_dimensions(
+                            sl_step_dir_od["prev_sdr"],
+                            sl_step_dir_od["temp_prev_sdr"],
+                            self.cores,
+                        )
+
                 sd_flows.append(np.sum(stp_dir.link_loads, axis=1))
 
                 copy_two_dimensions(prev_stp_dir.link_loads, ppst.link_loads, self.cores)
@@ -335,22 +416,51 @@ class LinearApproximation(WorkerThread):
         for c in self.traffic_classes:
             if c._aon_results.save_path_file:
                 c._aon_results.path_file_dir = os.path.join(
-                    path_base_dir, f"iter{self.iter}", f"path_c{c.mode}_{c.__id__}"
+                    path_base_dir, f"iter{self.iter}", f"path_c{c.mode}_{c._id}"
                 )
                 Path(c._aon_results.path_file_dir).mkdir(parents=True, exist_ok=True)
                 if self.iter == 1:  # save simplified graph correspondences, this could change after assignment
-                    c.graph.save_compressed_correspondence(path_base_dir, c.mode, c.__id__)
+                    c.graph.save_compressed_correspondence(path_base_dir, c.mode, c._id)
 
     def doWork(self):
         self.execute()
 
-    def execute(self):
+    def execute(self):  # noqa: C901
         # We build the fixed cost field
+
+        self.sl_step_dir_ll = {}
+        self.sl_step_dir_od = {}
 
         for c in self.traffic_classes:
             # Copying select link dictionary that maps name to its relevant matrices into the class' results
             c._aon_results._selected_links = c._selected_links
             c.results._selected_links = c._selected_links
+
+            link_loads_step_dir_shape = (
+                c.graph.compact_num_links,
+                c.results.classes["number"],
+            )
+
+            od_step_dir_shape = (
+                c.graph.num_zones,
+                c.graph.num_zones,
+                c.results.classes["number"],
+            )
+
+            self.sl_step_dir_ll[c._id] = {}
+            self.sl_step_dir_od[c._id] = {}
+            for name in c._selected_links.keys():
+                self.sl_step_dir_ll[c._id][name] = {
+                    "sdr": np.zeros(link_loads_step_dir_shape, dtype=c.graph.default_types("float")),
+                    "prev_sdr": np.zeros(link_loads_step_dir_shape, dtype=c.graph.default_types("float")),
+                    "temp_prev_sdr": np.zeros(link_loads_step_dir_shape, dtype=c.graph.default_types("float")),
+                }
+
+                self.sl_step_dir_od[c._id][name] = {
+                    "sdr": np.zeros(od_step_dir_shape, dtype=c.graph.default_types("float")),
+                    "prev_sdr": np.zeros(od_step_dir_shape, dtype=c.graph.default_types("float")),
+                    "temp_prev_sdr": np.zeros(od_step_dir_shape, dtype=c.graph.default_types("float")),
+                }
 
             # Sizes the temporary objects used for the results
             c.results.prepare(c.graph, c.matrix)
@@ -366,14 +476,15 @@ class LinearApproximation(WorkerThread):
                 c.fixed_cost[c.graph.graph.__supernet_id__] = v * c.fc_multiplier / c.vot
                 c.fixed_cost[np.isnan(c.fixed_cost)] = 0
 
-        # TODO: Review how to eliminate this. It looks unnecessary
-        # Just need to create some arrays for cost
-        for c in self.traffic_classes:
+            # TODO: Review how to eliminate this. It looks unnecessary
+            # Just need to create some arrays for cost
             c.graph.set_graph(self.time_field)
+
+            self.aons[c._id] = allOrNothing(c.matrix, c.graph, c._aon_results)
 
         self.logger.info(f"{self.algorithm} Assignment STATS")
         self.logger.info("Iteration, RelativeGap, stepsize")
-        for self.iter in range(1, self.max_iter + 1):
+        for self.iter in range(1, self.max_iter + 1):  # noqa: B020
             self.iteration_issue = []
             if pyqt:
                 self.equilibration.emit(["rgap", self.rgap])
@@ -388,7 +499,7 @@ class LinearApproximation(WorkerThread):
                 cost = c.fixed_cost + self.congested_time
                 aggregate_link_costs(cost, c.graph.compact_cost, c.results.crosswalk)
 
-                aon = allOrNothing(c.matrix, c.graph, c._aon_results)
+                aon = self.aons[c._id]  # This is a new object every iteration, with new aux_res
                 if pyqt:
                     aon.assignment.connect(self.signal_handler)
                 aon.execute()
@@ -412,14 +523,14 @@ class LinearApproximation(WorkerThread):
                             # The temp has an index associated with the link_set name
                             copy_three_dimensions(
                                 c.results.select_link_od.matrix[name],  # matrix being written into
-                                np.sum(aon.aux_res.temp_sl_od_matrix, axis=0)[
+                                np.sum(self.aons[c._id].aux_res.temp_sl_od_matrix, axis=0)[
                                     idx, :, :, :
                                 ],  # results after the iteration
                                 self.cores,  # core count
                             )
                             copy_two_dimensions(
                                 c.results.select_link_loading[name],  # ouput matrix
-                                np.sum(aon.aux_res.temp_sl_link_loading, axis=0)[idx, :, :],  # matrix 1
+                                np.sum(self.aons[c._id].aux_res.temp_sl_link_loading, axis=0)[idx, :, :],  # matrix 1
                                 self.cores,  # core count
                             )
                     flows.append(c.results.total_link_loads)
@@ -428,8 +539,10 @@ class LinearApproximation(WorkerThread):
                 self.__calculate_step_direction()
                 self.calculate_stepsize()
                 for c in self.traffic_classes:
-                    stp_dir = self.step_direction[c.__id__]
+                    stp_dir = self.step_direction[c._id]
+
                     cls_res = c.results
+
                     linear_combination(
                         cls_res.link_loads, stp_dir.link_loads, cls_res.link_loads, self.stepsize, self.cores
                     )
@@ -448,17 +561,17 @@ class LinearApproximation(WorkerThread):
                             # Copy the temporary results into the final od matrix, referenced by link_set name
                             # The temp flows have an index associated with the link_set name
                             linear_combination_skims(
-                                c.results.select_link_od.matrix[name],  # output matrix
-                                np.sum(aon.aux_res.temp_sl_od_matrix, axis=0)[idx, :, :, :],  # matrix 1
-                                c.results.select_link_od.matrix[name],  # matrix 2 (previous iteration)
+                                cls_res.select_link_od.matrix[name],  # output matrix
+                                self.sl_step_dir_od[c._id][name]["sdr"],
+                                cls_res.select_link_od.matrix[name],  # matrix 2 (previous iteration)
                                 self.stepsize,  # stepsize
                                 self.cores,  # core count
                             )
 
                             linear_combination(
-                                c.results.select_link_loading[name],  # output matrix
-                                np.sum(aon.aux_res.temp_sl_link_loading, axis=0)[idx, :, :],  # matrix 1
-                                c.results.select_link_loading[name],  # matrix 2 (previous iteration)
+                                cls_res.select_link_loading[name],  # output matrix
+                                self.sl_step_dir_ll[c._id][name]["sdr"],
+                                cls_res.select_link_loading[name],  # matrix 2 (previous iteration)
                                 self.stepsize,  # stepsize
                                 self.cores,  # core count
                             )
@@ -544,7 +657,7 @@ class LinearApproximation(WorkerThread):
         for c in self.traffic_classes:
             # fixed cost is scaled by vot
             class_link_costs = sum_a_times_b_minus_c(
-                c.fixed_cost, self.step_direction[c.__id__].link_loads[:, 0], c.results.link_loads[:, 0], self.cores
+                c.fixed_cost, self.step_direction[c._id].link_loads[:, 0], c.results.link_loads[:, 0], self.cores
             )
             class_specific_term += class_link_costs
         return class_specific_term

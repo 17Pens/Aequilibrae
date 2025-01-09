@@ -1,5 +1,7 @@
 import math
 import re
+from copy import deepcopy
+
 import numpy as np
 import pandas as pd
 import string
@@ -11,6 +13,8 @@ from ...utils import WorkerThread
 
 from aequilibrae import logger
 from aequilibrae.parameters import Parameters
+from aequilibrae.utils.db_utils import commit_and_close
+from aequilibrae.utils.spatialite_utils import connect_spatialite
 
 
 class GMNSBuilder(WorkerThread):
@@ -23,7 +27,7 @@ class GMNSBuilder(WorkerThread):
         self.nodes = net.nodes
         self.link_types = net.link_types
         self.modes = net.modes
-        self.conn = net.conn
+        self.__pth_file = net.project.path_to_file
 
         self.link_df = pd.read_csv(link_path).fillna("")
         self.node_df = pd.read_csv(node_path).fillna("")
@@ -96,7 +100,7 @@ class GMNSBuilder(WorkerThread):
 
         l_fields.save()
 
-        all_fields = [k for k in gmns_l_fields]
+        all_fields = list(gmns_l_fields)
         missing_f = [c for c in list(self.link_df.columns) if c not in all_fields]
         if missing_f != []:
             print(
@@ -121,7 +125,7 @@ class GMNSBuilder(WorkerThread):
 
         n_fields.save()
 
-        all_fields = [k for k in gmns_n_fields]
+        all_fields = list(gmns_n_fields)
         missing_f = [c for c in list(self.node_df.columns) if c not in all_fields]
         if missing_f != []:
             print(
@@ -246,7 +250,7 @@ class GMNSBuilder(WorkerThread):
         sorted_df.drop(to_drop_lst, axis=0, inplace=True)
         self.link_df = self.link_df[self.link_df.link_id.isin(list(sorted_df.link_id))]
         self.link_df.reset_index(drop=True, inplace=True)
-        direction = [x for x in list(self.link_df[gmns_dir])]
+        direction = list(self.link_df[gmns_dir])
 
         return direction
 
@@ -375,12 +379,13 @@ class GMNSBuilder(WorkerThread):
             pattern.sub(lambda x: "_" + char_replaces[x.group()], s).replace("+", "").replace("-", "_")
             for s in modes_list
         ]
-        mode_ids_list = [x for x in modes_list]
+        mode_ids_list = deepcopy(modes_list)
 
         saved_modes = list(self.modes.all_modes())
-        modes_df = pd.DataFrame(
-            self.conn.execute("select mode_name, mode_id from modes").fetchall(), columns=["name", "id"]
-        )
+        with commit_and_close(connect_spatialite(self.__pth_file)) as conn:
+            modes_df = pd.DataFrame(
+                conn.execute("select mode_name, mode_id from modes").fetchall(), columns=["name", "id"]
+            )
         for mode in list(dict.fromkeys(modes_list)):
             if mode in groups_dict.keys():
                 modes_gathered = [m.replace(" ", "") for m in groups_dict[mode].split(sep=",")]
@@ -411,7 +416,7 @@ class GMNSBuilder(WorkerThread):
                     new_mode.save()
 
                     mode_to_add += letters[0]
-                    saved_modes += [x for x in mode_to_add]
+                    saved_modes += list(mode_to_add)
                 else:
                     mode_to_add += modes_df.loc[modes_df.name == m, "id"].item()
 
@@ -494,16 +499,15 @@ class GMNSBuilder(WorkerThread):
         )
         n_params_list = aeq_nodes_df.to_records(index=False)
 
-        self.conn.executemany(n_query, n_params_list)
-        self.conn.commit()
+        with commit_and_close(connect_spatialite(self.__pth_file)) as conn:
+            conn.executemany(n_query, n_params_list)
 
-        l_query = "insert into links(" + ", ".join(list(links_fields.keys())) + ")"
-        l_query += (
-            " values("
-            + ", ".join(["GeomFromTEXT(?,4326)" if x == "geometry" else "?" for x in list(links_fields.keys())])
-            + ")"
-        )
-        l_params_list = aeq_links_df.to_records(index=False)
+            l_query = "insert into links(" + ", ".join(list(links_fields.keys())) + ")"
+            l_query += (
+                " values("
+                + ", ".join(["GeomFromTEXT(?,4326)" if x == "geometry" else "?" for x in list(links_fields.keys())])
+                + ")"
+            )
+            l_params_list = aeq_links_df.to_records(index=False)
 
-        self.conn.executemany(l_query, l_params_list)
-        self.conn.commit()
+            conn.executemany(l_query, l_params_list)

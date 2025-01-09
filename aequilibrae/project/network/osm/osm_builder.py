@@ -1,42 +1,41 @@
 import gc
 import importlib.util as iutil
-import sqlite3
 import string
 from typing import List
 
 import numpy as np
 import pandas as pd
+from shapely import Point
+from shapely.geometry import Polygon
 
 from aequilibrae.context import get_active_project
 from aequilibrae.parameters import Parameters
+from aequilibrae.project.network.haversine import haversine
 from aequilibrae.project.network.link_types import LinkTypes
+from aequilibrae.utils import WorkerThread
+from aequilibrae.utils.db_utils import commit_and_close
 from aequilibrae.utils.spatialite_utils import connect_spatialite
-from .haversine import haversine
-from ...utils import WorkerThread
 
-spec = iutil.find_spec("PyQt5")
-pyqt = spec is not None
+pyqt = iutil.find_spec("PyQt5") is not None
 if pyqt:
     from PyQt5.QtCore import pyqtSignal
 
-spec = iutil.find_spec("qgis")
-isqgis = spec is not None
-if isqgis:
-    import qgis
+if iutil.find_spec("qgis") is not None:
+    pass
 
 
 class OSMBuilder(WorkerThread):
     if pyqt:
         building = pyqtSignal(object)
 
-    def __init__(self, osm_items: List, path: str, node_start=10000, project=None) -> None:
+    def __init__(self, osm_items: List, project, model_area: Polygon) -> None:
         WorkerThread.__init__(self, None)
         self.project = project or get_active_project()
         self.logger = self.project.logger
         self.osm_items = osm_items
-        self.path = path
-        self.conn = None
-        self.node_start = node_start
+        self.model_area = model_area
+        self.path = self.project.path_to_file
+        self.node_start = 10000
         self.__link_types = None  # type: LinkTypes
         self.report = []
         self.__model_link_types = []
@@ -52,11 +51,13 @@ class OSMBuilder(WorkerThread):
             self.building.emit(*args)
 
     def doWork(self):
-        self.conn = connect_spatialite(self.path)
-        self.curr = self.conn.cursor()
-        self.__worksetup()
-        node_count = self.data_structures()
-        self.importing_links(node_count)
+        with commit_and_close(connect_spatialite(self.path)) as conn:
+            self.__worksetup()
+            node_count = self.data_structures()
+            self.importing_links(node_count, conn)
+            conn.execute(
+                "DELETE FROM nodes WHERE node_id NOT IN (SELECT a_node FROM links union all SELECT b_node FROM links)"
+            )
         self.__emit_all(["finished_threaded_procedure", 0])
 
     def data_structures(self):
@@ -87,6 +88,7 @@ class OSMBuilder(WorkerThread):
             nid = node.pop("id")
             _ = node.pop("type")
             node["node_id"] = i + self.node_start
+            node["inside_model"] = self.model_area.contains(Point(node["lon"], node["lat"]))
             self.nodes[nid] = node
             self.node_df.append([node["node_id"], nid, node["lon"], node["lat"]])
             self.__emit_all(["Value", i])
@@ -117,21 +119,21 @@ class OSMBuilder(WorkerThread):
 
         return node_count
 
-    def importing_links(self, node_count):
+    def importing_links(self, node_count, conn):
         node_ids = {}
 
         vars = {}
         vars["link_id"] = 1
         table = "links"
         fields = self.get_link_fields()
-        self.__update_table_structure()
+        self.__update_table_structure(conn)
         field_names = ",".join(fields)
 
         self.logger.info("Adding network nodes")
         self.__emit_all(["text", "Adding network nodes"])
         sql = "insert into nodes(node_id, is_centroid, osm_id, geometry) Values(?, 0, ?, MakePoint(?,?, 4326))"
-        self.conn.executemany(sql, self.node_df)
-        self.conn.commit()
+        conn.executemany(sql, self.node_df)
+        conn.commit()
         del self.node_df
 
         self.logger.info("Adding network links")
@@ -140,7 +142,7 @@ class OSMBuilder(WorkerThread):
         self.__emit_all(["maxValue", L])
 
         counter = 0
-        mode_codes, not_found_tags = self.modes_per_link_type()
+        mode_codes, not_found_tags = self.modes_per_link_type(conn)
         owf, twf = self.field_osm_source()
         all_attrs = []
         all_osm_ids = list(self.links.keys())
@@ -190,6 +192,8 @@ class OSMBuilder(WorkerThread):
             if len(vars["modes"]) > 0:
                 for i in range(segments):
                     attributes = self.__build_link_data(vars, intersections, i, linknodes, node_ids, fields)
+                    if attributes is None:
+                        continue
                     all_attrs.append(attributes)
                     vars["link_id"] += 1
 
@@ -199,14 +203,11 @@ class OSMBuilder(WorkerThread):
         self.logger.info("Adding network links")
         self.__emit_all(["text", "Adding network links"])
         try:
-            self.curr.executemany(sql, all_attrs)
+            conn.executemany(sql, all_attrs)
         except Exception as e:
             self.logger.error("error when inserting link {}. Error {}".format(all_attrs[0], e.args))
             self.logger.error(sql)
             raise e
-
-        self.conn.commit()
-        self.curr.close()
 
     def __worksetup(self):
         self.__link_types = self.project.network.link_types
@@ -215,16 +216,14 @@ class OSMBuilder(WorkerThread):
             self.__model_link_types.append(lt.link_type)
             self.__model_link_type_ids.append(lt_id)
 
-    def __update_table_structure(self):
-        curr = self.conn.cursor()
-        curr.execute("pragma table_info(Links)")
-        structure = curr.fetchall()
+    def __update_table_structure(self, conn):
+        structure = conn.execute("pragma table_info(Links)").fetchall()
         has_fields = [x[1].lower() for x in structure]
         fields = [field.lower() for field in self.get_link_fields()] + ["osm_id"]
         for field in [f for f in fields if f not in has_fields]:
             ltype = self.get_link_field_type(field).upper()
-            curr.execute(f"Alter table Links add column {field} {ltype}")
-        self.conn.commit()
+            conn.execute(f"Alter table Links add column {field} {ltype}")
+        conn.commit()
 
     def __build_link_data(self, vars, intersections, i, linknodes, node_ids, fields):
         ii = intersections[i]
@@ -249,6 +248,9 @@ class OSMBuilder(WorkerThread):
         )
 
         geometry = ["{} {}".format(self.nodes[x]["lon"], self.nodes[x]["lat"]) for x in all_nodes]
+        inside_area = sum([self.nodes[x]["inside_model"] for x in all_nodes])
+        if inside_area == 0:
+            return None
         geometry = "LINESTRING ({})".format(", ".join(geometry))
 
         attributes = [vars.get(x) for x in fields]
@@ -358,13 +360,11 @@ class OSMBuilder(WorkerThread):
                 }
         return owf, twf
 
-    def modes_per_link_type(self):
+    def modes_per_link_type(self, conn):
         p = Parameters()
         modes = p.parameters["network"]["osm"]["modes"]
 
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT mode_name, mode_id from modes")
-        mode_codes = cursor.fetchall()
+        mode_codes = conn.execute("SELECT mode_name, mode_id from modes").fetchall()
         mode_codes = {p[0]: p[1] for p in mode_codes}
 
         type_list = {}
